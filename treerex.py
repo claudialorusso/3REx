@@ -578,6 +578,34 @@ def save_rules_json(rules, output_path: Path):
 
     logger.info("Rules saved to %s", output_path)
 
+def save_rules_summary_csv(rules, output_path: Path):
+    if not rules:
+        raise ValueError("No rules are available to be summarized.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "rule_id",
+        "tree_index",
+        "leaf_node_id",
+        "depth",
+        "predicted_class",
+        "samples"
+    ]
+
+    with output_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for rule_index, rule in enumerate(rules, start=1):
+            writer.writerow({
+                "rule_id": rule_index,
+                "tree_index": rule["tree_index"],
+                "leaf_node_id": rule["leaf_node_id"],
+                "depth": len(rule["conditions"]), # tot. no of conditions in the path
+                "predicted_class": rule["predicted_class_label"],
+                "tree_train_samples": rule["samples"] # tot. no of training samples that reached the leaf
+            })
+    logger.info(f"Rule summary saved to {output_path}")
+
 def main():
     logger.info("\033[94mInitializing 3REx\033[0m")
     # read arguments
@@ -632,7 +660,7 @@ def main():
 
         for tree_index in range(total_trees):
             tree_rows = extract_rules(model=model, feature_names=feature_names, tree_index=tree_index)
-            all_rules.extend(tree_rows) #extend per evitare di creare lista di liste
+            all_rules.extend(tree_rows) #extend e non append per evitare di creare lista di liste
         """
         if all_rules:
             logger.info("\nFirst extracted rule:\n%s", json.dumps(all_rules[0], indent=2))
@@ -652,10 +680,14 @@ def main():
         model_name = model_path.stem
 
         run_output_dir = (args.output_dir / model_name / timestamp)
+
         txt_output_path = run_output_dir / "rules.txt"
         json_output_path = run_output_dir / "rules.json"
+        summary_output_path = (run_output_dir / "rules_summary.csv")
+
         save_rules_txt(formatted_rules=formatted_rules, output_path=txt_output_path)
         save_rules_json(rules=all_rules, output_path=json_output_path)
+        save_rules_summary_csv(rules=all_rules, output_path=summary_output_path)
 
 if __name__ == "__main__":
     start_time = time.time()
