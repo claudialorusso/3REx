@@ -7,6 +7,7 @@ import logging
 import time
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.tree import export_graphviz
+from sklearn.preprocessing import StandardScaler, OrdinalEncoder
 import json
 from datetime import datetime
 import subprocess
@@ -34,10 +35,17 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "--scalers",
+        type=Path,
+        default = None,
+        help="Optional path to the .pkl file containing the scalers used during the training."
+    )
+
+    parser.add_argument(
         "--features",
         type=Path,
         default=None,
-        help=("Optional path to the CSV file containing the ordered feature names. If absent, names are recovered from the model or generated automatically.")
+        help=("Optional path to the .csv file containing the ordered feature names. If absent, names are recovered from the model or generated automatically.")
     )
 
     parser.add_argument(
@@ -107,6 +115,34 @@ def __expand_condition(missing_go_to_left, threshold, feature_name, node_id, lef
         logger.info(
             f"Node {node_id}: NUMERIC SPLIT - if {condition} then go to node {left_child} else go to node {right_child}")
     return split_type, threshold_for_csv, condition
+
+def load_scalers(scalers_path: Path):
+    """
+    Loads the calers file and verifies the external structure
+    """
+    logger.info(f"Loading scalers from {scalers_path}")
+
+    with scalers_path.open("rb") as file:
+        scalers = pickle.load(file)
+
+    if not isinstance(scalers, (list, tuple)):
+        raise TypeError(f"Expected an ordered list or tuple of preprocessing objects, found {type(scalers).__name__}.")
+
+    return scalers
+
+def validate_model_scalers(model, scalers):
+    """
+    Validates the scalers according to the model in input.
+    """
+    expected_count = int(model.n_features_in_)
+    actual_count = len(scalers)
+
+    if actual_count != expected_count:
+        raise ValueError(f"Scaler inconsistency: model expects {expected_count} features, but the scaler file contains {actual_count} objects.")
+
+    for feature_index, scaler in enumerate(scalers):
+        if not hasattr(scaler, "transform"): # non usiamo fit_transform ma transform durante l'inferenza
+            raise TypeError(f"Object at feature position {feature_index} does not provide transform().")
 
 def inspect_tree(model: RandomForestClassifier, feature_names: Sequence[str], tree_index: int):
     """
@@ -261,7 +297,10 @@ def __visit_node(model, tree, feature_names, tree_index, node_id, current_condit
         __visit_node(model, tree, feature_names, tree_index, right_child, right_conditions, rules)
         return
 
-def __format_condition(condition):
+def __format_condition(condition, use_original_threshold=False):
+    """
+    Formats a condition. If use_original_threshold=False, then scalers are used.
+    """
     feature_name = condition["feature_name"]
     operator = condition["operator"]
     threshold = condition["threshold"]
@@ -269,6 +308,13 @@ def __format_condition(condition):
 
     if operator in {"IS MISSING", "IS NOT MISSING"}:
         return f"{feature_name} {operator}"
+
+    if use_original_threshold:
+        threshold = condition.get("threshold_original")
+        if threshold is None:
+            raise ValueError(f"Original threshold is unavailable for feature {feature_name}.")
+    else:
+        threshold = condition["threshold"]
 
     numeric_condition = (f"{feature_name} {operator} {threshold:.6f}")
 
@@ -282,7 +328,7 @@ def __format_condition(condition):
 
     return numeric_condition
 
-def __format_rule(rule):
+def __format_rule(rule, use_original_threshold=False):
     """
     Converts the conditions into a text and adds the text to a list.
     All conditions are then joined through an 'AND'.
@@ -290,7 +336,7 @@ def __format_rule(rule):
     """
     rule_text = "IF "
     for condition_index, condition in enumerate(rule["conditions"]):
-        condition_text = __format_condition(condition)
+        condition_text = __format_condition(condition, use_original_threshold)
         if condition_index > 0:
             rule_text += " AND "
 
@@ -330,6 +376,39 @@ def __validate_rule_path(tree, rule):
     if expected_node_id != rule["leaf_node_id"]:
         raise RuntimeError(f"Rule ends at node {expected_node_id}, but its declared leaf is {rule['leaf_node_id']}.")
 
+def __recover_original_threshold(condition, scalers):
+    threshold = condition["threshold"]
+    if threshold is None:
+        return None
+
+    feature_index = condition["feature_index"]
+    scaler = scalers[feature_index]
+    if not isinstance(scaler, StandardScaler):
+        return None
+    if not hasattr(scaler, "mean_") or not hasattr(scaler, "scale_"):
+        raise ValueError(f"StandardScaler for feature {feature_index} does not appear to be fitted.")
+
+    mean = float(scaler.mean_[0])
+    scale = float(scaler.scale_[0])
+    original_threshold = threshold * scale + mean
+
+    return float(original_threshold)
+
+def add_original_thresholds(rules, scalers):
+    """
+    Adds up the original threshold to all the conditions. This works only when the --scalers argument is passed.
+    For each rule -> condition, it computes the original threshold and adds up the threshold_original
+    """
+    converted_thresholds = 0
+
+    for rule in rules:
+        for condition in rule["conditions"]:
+            original_threshold = __recover_original_threshold(condition=condition, scalers=scalers)
+            condition["threshold_original"] = original_threshold
+            if original_threshold is not None:
+                converted_thresholds += 1
+
+    logger.info(f"Recovered {converted_thresholds} original-scale thresholds.")
 
 def extract_rules(model: RandomForestClassifier, feature_names: Sequence[str], tree_index: int):
     """
@@ -616,12 +695,20 @@ def main():
         raise ValueError("--visualization-depth must be greater than or equal to 1.")
     model_path = args.model
     features_path = args.features
+    scalers_path = args.scalers
     # control file existance
     validate_input(model_path, "Model file")
     if features_path is not None:
         validate_input(features_path, "Feature file")
+    if scalers_path is not None:
+        validate_input(scalers_path, "Scalers file")
     # load model
     model = load_model(model_path)
+    scalers = None
+    if scalers_path is not None:
+        scalers = load_scalers(scalers_path)
+        validate_model_scalers(model=model, scalers=scalers)
+        logger.info(f"Successfully loaded and validated {len(scalers)} preprocessing objects.")
 
     # if the feature_names csv exists, recover feature names
     if features_path is not None:
@@ -683,27 +770,57 @@ def main():
         if all_rules:
             logger.info("\nFirst extracted rule:\n%s", json.dumps(all_rules[0], indent=2))
             logger.info(f"\nFirst formatted rule:\n{__format_rule(all_rules[0])}")
-        """
-        formatted_rules = []
-        for rule in all_rules:
-            formatted_rule = __format_rule(rule)
-            formatted_rules.append(formatted_rule)
-        if len(formatted_rules) != len(all_rules):
-            raise RuntimeError(f"Rule formatting inconsistency: extracted {len(all_rules)} rules, but formatted {len(formatted_rules)}.")
-        if formatted_rules:
-            logger.info(f"First formatted rule:\n{formatted_rules[0]}")
-        logger.info(f"\033[32mSuccessfully extracted {len(all_rules)} total rules.\033[0m")
+        
 
+        if scalers is not None and all_rules:
+            first_condition = all_rules[0]["conditions"][0]
+
+            original_threshold = __recover_original_threshold(condition=first_condition, scalers=scalers)
+
+            logger.info(f"First condition model threshold: {first_condition['threshold']}")
+            logger.info(f"First condition original threshold: {original_threshold}")
+        """
+        if scalers is not None and all_rules:
+            add_original_thresholds(rules=all_rules, scalers=scalers)
+            scaler_type_counts = {}
+            for scaler in scalers:
+                scaler_type = type(scaler).__name__
+                if scaler_type not in scaler_type_counts:
+                    scaler_type_counts[scaler_type] = 0
+                scaler_type_counts[scaler_type] += 1
+            logger.info(f"Object types: {scaler_type_counts}")
+
+        formatted_rules_model = []
+        formatted_rules_original = []
+        for rule in all_rules:
+            model_rule = __format_rule(rule, use_original_threshold=False)
+            formatted_rules_model.append(model_rule)
+            if scalers is not None:
+                original_rule = __format_rule(rule, use_original_threshold=True)
+                formatted_rules_original.append(original_rule)
+        if len(formatted_rules_model) != len(all_rules):
+            raise RuntimeError(f"Rule formatting inconsistency: extracted {len(all_rules)} rules, but formatted {len(formatted_rules_model)}.")
+        if scalers is not None and len(formatted_rules_original) != len(all_rules)):
+            raise RuntimeError(f"Scaler-space inconsistency: extracted {len(all_rules)} rules, but formatted {len(formatted_rules_original)}.")
+        if formatted_rules_model:
+            logger.info(f"First formatted rule:\n{formatted_rules_model[0]}")
+        logger.info(f"\033[32mSuccessfully extracted {len(all_rules)} total rules.\033[0m")
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_name = model_path.stem
 
         run_output_dir = (args.output_dir / model_name / timestamp)
 
         txt_output_path = run_output_dir / "rules.txt"
+
         json_output_path = run_output_dir / "rules.json"
         summary_output_path = (run_output_dir / "rules_summary.csv")
 
-        save_rules_txt(formatted_rules=formatted_rules, output_path=txt_output_path)
+        save_rules_txt(formatted_rules=formatted_rules_model, output_path=txt_output_path)
+        if scalers is not None:
+            txt_output_path_scalers = run_output_dir / "rules_with_scalers.txt"
+            save_rules_txt(formatted_rules=formatted_rules_original, output_path=txt_output_path_scalers)
+
         save_rules_json(rules=all_rules, output_path=json_output_path)
         save_rules_summary_csv(rules=all_rules, output_path=summary_output_path)
 
