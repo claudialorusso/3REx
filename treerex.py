@@ -36,8 +36,8 @@ def parse_arguments():
     parser.add_argument(
         "--features",
         type=Path,
-        required=True,
-        help="Path to the CSV file containing the ordered feature names."
+        default=None,
+        help=("Optional path to the CSV file containing the ordered feature names. If absent, names are recovered from the model or generated automatically.")
     )
 
     parser.add_argument(
@@ -618,10 +618,28 @@ def main():
     features_path = args.features
     # control file existance
     validate_input(model_path, "Model file")
-    validate_input(features_path, "Feature file")
+    if features_path is not None:
+        validate_input(features_path, "Feature file")
     # load model
     model = load_model(model_path)
-    feature_names = load_feature_names(features_path)
+
+    # if the feature_names csv exists, recover feature names
+    if features_path is not None:
+        feature_names = load_feature_names(features_path)
+    # if the user did not provide the csv, try to extract feature names from the model
+    elif hasattr(model, "feature_names_in_"):
+        feature_names = []
+        for feature_name in model.feature_names_in_:
+            feature_names.append(str(feature_name))
+        logger.info("Feature names recovered from the model.")
+    # if no feature name is available, automatically generate them
+    else:
+        feature_names = []
+        for feature_index in range(model.n_features_in_):
+            feature_names.append(f"feature_{feature_index}")
+
+        logger.warning("No feature names were provided or stored in the model. Generated generic feature names.")
+
     # verify that model features' number == #features in features_names.csv
     validate_model_features(model=model, feature_names=feature_names)
 
