@@ -6,6 +6,12 @@ import csv
 import logging
 import time
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.tree import export_graphviz
+import json
+from datetime import datetime
+import subprocess
+import math
+import re
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 
@@ -34,6 +40,34 @@ def parse_arguments():
         help="Path to the CSV file containing the ordered feature names."
     )
 
+    parser.add_argument(
+        "--mode",
+        choices=["validate", "inspect", "extract"],
+        default="validate",
+        help="Execution mode: 'validate' only checks inputs; 'inspect' prints basic tree information; 'extract' extracts decisional tree rules."
+    )
+
+    parser.add_argument(
+        "--max-trees",
+        type=int,
+        default=1,
+        help="Maximum number of trees to inspect."
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs"),
+        help="Directory where 3REx output files are saved."
+    )
+
+    parser.add_argument(
+        "--visualization-depth",
+        type=int,
+        default=4,
+        help="Maximum tree depth shown in the generated graph visualization."
+    )
+
     arguments = parser.parse_args()
     return arguments
 
@@ -44,7 +78,7 @@ def validate_input(path: Path, description : str):
     if not path.exists():
         raise FileNotFoundError(f"{description} does not exist: {path}")
     if not path.is_file():
-        raise ValueError(f"{description} does not a real file: {path}")
+        raise ValueError(f"{description} is not a real file: {path}")
 
 def validate_model_features(model: RandomForestClassifier, feature_names: Sequence[str]):
     """
@@ -55,6 +89,272 @@ def validate_model_features(model: RandomForestClassifier, feature_names: Sequen
 
     if model_feature_count != input_feature_count:
         raise ValueError(f"Inconsistency: model expects {model_feature_count} features, but the feature file contains {input_feature_count} rows.")
+
+def __expand_condition(missing_go_to_left, threshold, feature_name, node_id, left_child, right_child):
+    if math.isnan(threshold):
+        split_type = "missing"
+        threshold_for_csv = ""
+        if missing_go_to_left:
+            condition = f"{feature_name} IS MISSING"
+        else:
+            condition = f"{feature_name} IS NOT MISSING"
+        logger.info(
+            f"Node {node_id}: MISSING SPLIT - if {condition} then go to node {left_child} else go to node {right_child}")
+    else:
+        split_type = "numeric"
+        threshold_for_csv = threshold
+        condition = f"{feature_name} <= {threshold:.6f}"
+        logger.info(
+            f"Node {node_id}: NUMERIC SPLIT - if {condition} then go to node {left_child} else go to node {right_child}")
+    return split_type, threshold_for_csv, condition
+
+def inspect_tree(model: RandomForestClassifier, feature_names: Sequence[str], tree_index: int):
+    """
+    Prints basic information about one decision tree inside the Random Forest
+    """
+    estimator = model.estimators_[tree_index]
+    tree = estimator.tree_
+
+    inspection_rows = []
+
+    logger.info("\033[33mInspecting tree %d\033[0m", tree_index)
+    logger.info("\033[32mTree node count: %d\033[0m", tree.node_count)
+    logger.info("\033[32mTree max depth: %d\033[0m", estimator.get_depth())
+    logger.info("\033[32mTree number of leaves: %d\033[0m", estimator.get_n_leaves())
+
+    max_nodes_to_print = min(10, tree.node_count)
+
+    logger.info("\033[33mFirst %d nodes:\033[0m", max_nodes_to_print)
+
+    for node_id in range(max_nodes_to_print):
+        feature_index = tree.feature[node_id]
+
+        if feature_index == -2: # leaf node
+            samples = tree.n_node_samples[node_id]
+            class_values = tree.value[node_id][0]
+            predicted_class_index = int(class_values.argmax())
+            predicted_class_label = model.classes_[predicted_class_index]
+            inspection_rows.append({
+                "tree_index": tree_index,
+                "node_id": node_id,
+                "node_type": "leaf",
+                "split_type": "",
+                "feature_index": "",
+                "feature_name": "",
+                "condition": "",
+                "threshold": "",
+                "missing_go_to_left": "",
+                "left_child": "",
+                "right_child": "",
+                "samples": int(samples),
+                "predicted_class_index": predicted_class_index,
+                "predicted_class_label": str(predicted_class_label),
+                "class_values": json.dumps(class_values.tolist())
+            })
+
+            logger.info(f"Node {node_id}: LEAF : samples={samples} ; predicted_class_index={predicted_class_index} ; class_values={class_values}")
+
+        else: #intermediate node
+            feature_name = feature_names[feature_index]
+            threshold = float(tree.threshold[node_id])
+            left_child = int(tree.children_left[node_id])
+            right_child = int(tree.children_right[node_id])
+            samples = int(tree.n_node_samples[node_id])
+            missing_go_to_left = (bool(tree.missing_go_to_left[node_id]) if hasattr(tree, "missing_go_to_left") else None)
+            split_type, threshold_for_csv, condition = __expand_condition(missing_go_to_left, threshold, feature_name,
+                                                                          node_id, left_child, right_child)
+            inspection_rows.append({
+                "tree_index": tree_index,
+                "node_id": node_id,
+                "node_type": "split",
+                "split_type": split_type,
+                "feature_index": int(feature_index),
+                "feature_name": feature_name,
+                "condition": condition,
+                "threshold": threshold_for_csv,
+                "missing_go_to_left": missing_go_to_left,
+                "left_child": left_child,
+                "right_child": right_child,
+                "samples": samples,
+                "predicted_class_index": "",
+                "predicted_class_label": "",
+                "class_values": ""
+            })
+    return inspection_rows
+
+def __visit_node(model, tree, feature_names, tree_index, node_id, current_conditions, rules):
+    """
+    Visits the node, traverses the tree and extracts rules from the current node.
+    """
+    feature_index = int(tree.feature[node_id])
+    if feature_index == -2: #leaf node
+        samples = int(tree.n_node_samples[node_id])
+        class_values = tree.value[node_id][0]
+        predicted_class_index = int(class_values.argmax())
+        predicted_class_label = model.classes_[predicted_class_index]
+        rule = {
+            "tree_index": tree_index,
+            "leaf_node_id": node_id,
+            "conditions": list(current_conditions),
+            "predicted_class_index": predicted_class_index,
+            "predicted_class_label": str(predicted_class_label),
+            "samples": samples,
+            "class_values": class_values.tolist()
+        }
+        rules.append(rule)
+        return
+    else: #intermediate node
+        feature_name = feature_names[feature_index]
+        threshold = float(tree.threshold[node_id])
+        left_child = int(tree.children_left[node_id])
+        right_child = int(tree.children_right[node_id])
+        #samples = int(tree.n_node_samples[node_id])
+        missing_go_to_left = (bool(tree.missing_go_to_left[node_id]) if hasattr(tree, "missing_go_to_left") else None)
+        right_accepts_missing = (None if missing_go_to_left is None else not missing_go_to_left)
+        if not math.isnan(threshold):
+            left_condition = {
+                "feature_index": feature_index,
+                "feature_name": feature_name,
+                "operator": "<=",
+                "threshold": threshold,
+                "accepts_missing": missing_go_to_left
+            }
+            right_condition = {
+                "feature_index": feature_index,
+                "feature_name": feature_name,
+                "operator": ">",
+                "threshold": threshold,
+                "accepts_missing": right_accepts_missing
+            }
+        else:
+            if missing_go_to_left:
+                left_operator = "IS MISSING"
+                right_operator = "IS NOT MISSING"
+            else:
+                left_operator = "IS NOT MISSING"
+                right_operator = "IS MISSING"
+            left_condition = {
+                "feature_index": feature_index,
+                "feature_name": feature_name,
+                "operator": left_operator,
+                "threshold": None,
+                "accepts_missing": missing_go_to_left
+            }
+            right_condition = {
+                "feature_index": feature_index,
+                "feature_name": feature_name,
+                "operator": right_operator,
+                "threshold": None,
+                "accepts_missing": right_accepts_missing
+            }
+        left_condition["node_id"] = node_id
+        left_condition["branch"] = "left"
+        left_condition["child_node_id"] = left_child
+
+        right_condition["node_id"] = node_id
+        right_condition["branch"] = "right"
+        right_condition["child_node_id"] = right_child
+
+        left_conditions = current_conditions + [left_condition]
+        right_conditions = current_conditions + [right_condition]
+        __visit_node(model, tree, feature_names, tree_index, left_child, left_conditions, rules)
+        __visit_node(model, tree, feature_names, tree_index, right_child, right_conditions, rules)
+        return
+
+def __format_condition(condition):
+    feature_name = condition["feature_name"]
+    operator = condition["operator"]
+    threshold = condition["threshold"]
+    accepts_missing = condition["accepts_missing"]
+
+    if operator in {"IS MISSING", "IS NOT MISSING"}:
+        return f"{feature_name} {operator}"
+
+    numeric_condition = (f"{feature_name} {operator} {threshold:.6f}")
+
+    if accepts_missing is True:
+        return (f"({numeric_condition} OR {feature_name} IS MISSING)")
+
+    """
+    if accepts_missing is False:
+        return (f"({feature_name} IS NOT MISSING AND {numeric_condition})")
+    """
+
+    return numeric_condition
+
+def __format_rule(rule):
+    """
+    Converts the conditions into a text and adds the text to a list.
+    All conditions are then joined through an 'AND'.
+    Each rule is finally formatted as 'IF conditions THEN class = outcome'.
+    """
+    rule_text = "IF "
+    for condition_index, condition in enumerate(rule["conditions"]):
+        condition_text = __format_condition(condition)
+        if condition_index > 0:
+            rule_text += " AND "
+
+        rule_text += condition_text
+
+    if not rule["conditions"]:
+        rule_text += "TRUE"
+
+    outcome = rule["predicted_class_label"]
+    #outcome = 'licit' if outcome==0 else 'suspicious'
+    rule_text += f" THEN class = {outcome}"
+
+    return rule_text
+
+def __validate_rule_path(tree, rule):
+    expected_node_id = 0
+
+    for condition in rule["conditions"]:
+        node_id = condition["node_id"]
+        branch = condition["branch"]
+        child_node_id = condition["child_node_id"]
+
+        if node_id != expected_node_id:
+            raise RuntimeError(f"Broken rule path: expected node {expected_node_id} found node {node_id}.")
+
+        if branch == "left":
+            expected_child = int(tree.children_left[node_id])
+        elif branch == "right":
+            expected_child = int(tree.children_right[node_id])
+        else:
+            raise RuntimeError(f"Unknown branch: {branch}")
+
+        if child_node_id != expected_child:
+            raise RuntimeError(f"Invalid child for node {node_id}: expected {expected_child}, found {child_node_id}.")
+
+        expected_node_id = child_node_id
+    if expected_node_id != rule["leaf_node_id"]:
+        raise RuntimeError(f"Rule ends at node {expected_node_id}, but its declared leaf is {rule['leaf_node_id']}.")
+
+
+def extract_rules(model: RandomForestClassifier, feature_names: Sequence[str], tree_index: int):
+    """
+    Extracts rules from a single dicision tree in the Random Forest.
+    """
+    estimator = model.estimators_[tree_index]
+    tree = estimator.tree_
+
+    node_count = tree.node_count
+    logger.info("\033[33mExtracting rules from tree %d\033[0m", tree_index)
+    logger.info("\033[32mTree node count: %d\033[0m", node_count)
+    logger.info("\033[32mTree max depth: %d\033[0m", estimator.get_depth())
+    logger.info("\033[32mTree number of leaves/rules: %d\033[0m", estimator.get_n_leaves())
+
+    rules = []
+    current_conditions = []
+    __visit_node(model, tree, feature_names, tree_index, node_id=0, current_conditions=current_conditions, rules= rules)
+    for rule in rules:
+        __validate_rule_path(tree, rule)
+
+    expected_rules = estimator.get_n_leaves()
+    if len(rules) != expected_rules:
+        raise RuntimeError(f"Rule extraction inconsistency: expected {expected_rules} rules, but extracted {len(rules)}.")
+    logger.info(f"Successfully extracted {len(rules)} rules from tree {tree_index}")
+    return rules
 
 def load_model(model_path):
     """
@@ -75,24 +375,20 @@ def load_feature_names(features_path: Path):
     logger.info("\033[33mLoading feature names from %s\033[0m", features_path)
 
     feature_names = []
-
     with features_path.open(mode="r", newline="", encoding="utf-8-sig") as file:
         reader = csv.DictReader(file)
         required_columns = {"feature_position", "feature_name"}
-        missing_columns = required_columns - set(reader.fieldnames or [])
 
+        missing_columns = required_columns - set(reader.fieldnames or [])
         if missing_columns:
-            raise ValueError(
-                f"Feature file is missing required columns: {sorted(missing_columns)}"
-            )
+            raise ValueError(f"Feature file is missing required columns: {sorted(missing_columns)}")
+
         rows = []
         for row in reader:
-            rows.append(
-                {
-                    "feature_position": int(row["feature_position"]),
-                    "feature_name": row["feature_name"]
-                }
-            )
+            rows.append({
+                "feature_position": int(row["feature_position"]),
+                "feature_name": row["feature_name"]
+            })
     rows.sort(key=lambda row: row["feature_position"])
 
     expected_positions = list(range(len(rows)))
@@ -102,10 +398,7 @@ def load_feature_names(features_path: Path):
         actual_position.append(row["feature_position"])
 
     if actual_position != expected_positions:
-        raise ValueError(
-            "Feature positions are not contiguous or do not start from 0. "
-            f"Expected {expected_positions[:10]}..., found {actual_position[:10]}..."
-        )
+        raise ValueError(f"Feature positions are not contiguous or do not start from 0. Expected {expected_positions[:10]}..., found {actual_position[:10]}...")
 
     feature_names = []
     for row in rows:
@@ -114,10 +407,168 @@ def load_feature_names(features_path: Path):
 
     return feature_names
 
+def save_inspection_csv(inspection_rows: list[dict], output_path: Path):
+    """
+    Save inspected tree nodes to CSV
+    """
+    if not inspection_rows:
+        raise ValueError("No inspection rows are available to be saved.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "tree_index",
+        "node_id",
+        "node_type",
+        "split_type",
+        "feature_index",
+        "feature_name",
+        "condition",
+        "threshold",
+        "missing_go_to_left",
+        "left_child",
+        "right_child",
+        "samples",
+        "predicted_class_index",
+        "predicted_class_label",
+        "class_values"
+    ]
+
+    with output_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(inspection_rows)
+
+    logger.info("\033[33mTree inspection saved to %s\033[0m", output_path)
+
+def save_tree_visualization( model: RandomForestClassifier, feature_names: Sequence[str], tree_index: int, output_dir: Path, max_depth: int):
+    """
+    Saves one decision tree as a Graphviz .dot file and, when Gtaphviz is available, also extracts its .png.
+    """
+    estimator = model.estimators_[tree_index]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dot_path = output_dir / f"tree_{tree_index:03d}.dot"
+    png_path = output_dir / f"tree_{tree_index:03d}.png"
+
+    export_graphviz(
+        # the tree to export
+        estimator,
+        # output directory for the .dot file
+        out_file=str(dot_path),
+        # names of the features
+        feature_names=list(feature_names),
+        # class label names
+        class_names=[str(label) for label in model.classes_],
+        # changes nodes' colour
+        filled=True,
+        # roundes nodes visualization
+        rounded=True,
+        # special characters cannot be used
+        special_characters=False,
+        # impurity level of the node (e.g., gini impurity)
+        impurity=True,
+        # if False, no percentage but numbers (e.g. samples = 3 instead of 3.3% and value=[6, 48] instead of [0.1111, 0.88889]
+        proportion=False,
+        # number of decimals in floating numbers
+        precision=4,
+        # depth of the visualization
+        max_depth=max_depth,
+        # shows the id of the node in the label
+        node_ids=True
+    )
+    replace_missing_split_labels(dot_path=dot_path, estimator=estimator, feature_names=feature_names)
+    logger.info(f"\033[33mTree {tree_index} .dot visualization saved to {dot_path}\033[0m")
+
+    try:
+        subprocess.run(
+            ["dot", "-Tpng", str(dot_path), "-o", str(png_path)],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        logger.info(f"\033[33mTree {tree_index} .png graph saved to {png_path}\033[0m")
+
+    except FileNotFoundError:
+        logger.warning(f"Graphviz executable 'dot' is not installed or not available in the path. The .dot file was still generated: {dot_path}")
+
+    except subprocess.CalledProcessError as exc:
+        logger.warning(f"Graphviz failed while graphically creating the tree {tree_index}. The .dot file is still available at {dot_path}. Error: {exc.stderr}")
+
+def replace_missing_split_labels(dot_path: Path, estimator, feature_names: Sequence[str]):
+    """
+    Replace Graphviz labels including nan (e.g., 'feature <= nan') with explicit
+    missing-value conditions (e.g., 'feature IS MISSING' or 'IS NOT MISSING').
+    The current function does not modify tree/estimator's behaviour it just
+    adjusts the Graphvix .dot text file so to let nodes, separating missing values, become meaningful.
+    """
+    # recover tree's internal structure
+    tree = estimator.tree_
+    #read dot file
+    dot_text = dot_path.read_text(encoding="utf-8")
+
+    # check whether the current tree includes missing_go_to_left values
+    if not hasattr(tree, "missing_go_to_left"):
+        logger.warning("The current tree does not include missing_go_to_left. NaN split labels cannot be rewritten safely.")
+        return
+
+    replaced_nodes = 0
+    # check for nan values
+    for node_id, threshold in enumerate(tree.threshold):
+        # ignore normal numerical splits
+        if not math.isnan(float(threshold)):
+            # no nan? continue to next node
+            continue
+
+        feature_index = int(tree.feature[node_id])
+
+        if feature_index < 0:
+            continue
+
+        feature_name = feature_names[feature_index]
+        missing_go_to_left = bool(tree.missing_go_to_left[node_id])
+
+        original_condition = f"{feature_name} <= nan"
+
+        if missing_go_to_left:
+            readable_condition = f"{feature_name} IS MISSING"
+        else:
+            readable_condition = f"{feature_name} IS NOT MISSING"
+
+        if original_condition not in dot_text:
+            logger.warning(f"Could not find Graphviz condition for tree node {node_id}: {original_condition}")
+            continue
+
+        dot_text = dot_text.replace(original_condition, readable_condition, 1)
+
+        replaced_nodes += 1
+
+        logger.info(f"Tree node {node_id} missing split rewritten as: {readable_condition}")
+
+    dot_path.write_text(dot_text, encoding="utf-8")
+
+    logger.info(f"\033[33mRewritten {replaced_nodes} missing-value split label(s) in {dot_path}\033[0m")
+
+def save_rules_txt(formatted_rules, output_path: Path):
+    if not formatted_rules:
+        raise ValueError("No formatted rules are available to be saved.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as file:
+        for rule_index, rule_text in enumerate(formatted_rules, start=1):
+            file.write(f"RULE {rule_index}\n")
+            file.write(rule_text)
+            file.write("\n\n")
+
+    logger.info(f"Formatted rules saved to {output_path}")
+
 def main():
     logger.info("\033[94mInitializing 3REx\033[0m")
     # read arguments
     args = parse_arguments()
+    if args.max_trees < 1:
+        raise ValueError("--max-trees must be greater than or equal to 1.")
+    if args.visualization_depth < 1:
+        raise ValueError("--visualization-depth must be greater than or equal to 1.")
     model_path = args.model
     features_path = args.features
     # control file existance
@@ -135,7 +586,62 @@ def main():
     logger.info("\033[32mNumber of features: %d\033[0m", len(feature_names))
     logger.info("\033[32mFirst feature: %s\033[0m", feature_names[0])
     logger.info("\033[32mLast feature: %s\033[0m", feature_names[-1])
+    if args.mode == "inspect":
+        total_trees = len(model.estimators_)
+        trees_to_inspect = min(args.max_trees, total_trees)
+        logger.info("\033[33mInspecting %d tree(s) out of %d\033[0m", trees_to_inspect, total_trees)
 
+        inspection_rows = []
+
+        for tree_index in range(trees_to_inspect):
+            tree_rows = inspect_tree(model=model, feature_names=feature_names, tree_index=tree_index)
+            inspection_rows.extend(tree_rows)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_name = model_path.stem
+
+        run_output_dir = (args.output_dir / model_name / timestamp)
+
+        inspection_output_path = run_output_dir / "tree_inspection.csv"
+
+        save_inspection_csv(inspection_rows=inspection_rows, output_path=inspection_output_path)
+        for tree_index in range(trees_to_inspect):
+            save_tree_visualization( model=model, feature_names=feature_names, tree_index=tree_index, output_dir=run_output_dir, max_depth=args.visualization_depth)
+    if args.mode == "extract":
+        total_trees = len(model.estimators_)
+        logger.info(f"\033[33mExtracting rules from {total_trees} tree(s).\033[0m")
+
+        all_rules = []
+
+        for tree_index in range(total_trees):
+            tree_rows = extract_rules(model=model, feature_names=feature_names, tree_index=tree_index)
+            all_rules.extend(tree_rows) #extend per evitare di creare lista di liste
+        """
+        if all_rules:
+            logger.info("\nFirst extracted rule:\n%s", json.dumps(all_rules[0], indent=2))
+            logger.info(f"\nFirst formatted rule:\n{__format_rule(all_rules[0])}")
+        """
+        formatted_rules = []
+        for rule in all_rules:
+            formatted_rule = __format_rule(rule)
+            formatted_rules.append(formatted_rule)
+        if len(formatted_rules) != len(all_rules):
+            raise RuntimeError(f"Rule formatting inconsistency: extracted {len(all_rules)} rules, but formatted {len(formatted_rules)}.")
+        if formatted_rules:
+            logger.info(f"First formatted rule:\n{formatted_rules[0]}")
+        logger.info(f"\033[32mSuccessfully extracted {len(all_rules)} total rules.\033[0m")
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_name = model_path.stem
+
+        run_output_dir = (args.output_dir / model_name / timestamp)
+        txt_output_path = run_output_dir / "rules.txt"
+        save_rules_txt(formatted_rules=formatted_rules, output_path=txt_output_path)
+        """
+        extraction_output_path = run_output_dir / "tree_rules_extraction.csv"
+
+        save_inspection_csv(extraction_rows=inspection_rows, output_path=extraction_output_path)
+        """
 if __name__ == "__main__":
     start_time = time.time()
 
