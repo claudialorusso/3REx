@@ -589,7 +589,7 @@ def save_rules_summary_csv(rules, output_path: Path):
         "leaf_node_id",
         "depth",
         "predicted_class",
-        "samples"
+        "tree_train_samples"
     ]
 
     with output_path.open("w", newline="", encoding="utf-8") as file:
