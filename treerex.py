@@ -561,6 +561,23 @@ def save_rules_txt(formatted_rules, output_path: Path):
 
     logger.info(f"Formatted rules saved to {output_path}")
 
+def save_rules_json(rules, output_path: Path):
+    if not rules:
+        raise ValueError("No rules are available to be saved.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_path.open("w", encoding="utf-8") as file:
+        # directly writes on file (does not produce a string)
+        json.dump(
+            rules,
+            file,
+            indent=2, # more readable
+            ensure_ascii=False #preserves non ASCII chars
+        )
+
+    logger.info("Rules saved to %s", output_path)
+
 def main():
     logger.info("\033[94mInitializing 3REx\033[0m")
     # read arguments
@@ -636,12 +653,10 @@ def main():
 
         run_output_dir = (args.output_dir / model_name / timestamp)
         txt_output_path = run_output_dir / "rules.txt"
+        json_output_path = run_output_dir / "rules.json"
         save_rules_txt(formatted_rules=formatted_rules, output_path=txt_output_path)
-        """
-        extraction_output_path = run_output_dir / "tree_rules_extraction.csv"
+        save_rules_json(rules=all_rules, output_path=json_output_path)
 
-        save_inspection_csv(extraction_rows=inspection_rows, output_path=extraction_output_path)
-        """
 if __name__ == "__main__":
     start_time = time.time()
 
