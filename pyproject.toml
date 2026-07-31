@@ -1,10 +1,19 @@
 [project]
 name = "3rex"
 version = "0.1.0"
+description = "3REx extracts human-readable rules from pre-trained Random Forest models."
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "joblib==1.5.2",
+    "matplotlib>=3.11.1",
     "numpy==2.3.4",
+    "pandas>=3.0.3",
+    "polars>=1.42.1",
     "scikit-learn==1.7.2",
     "scipy==1.16.3",
+]
+
+[tool.uv.workspace]
+members = [
+    "deleteme",
 ]
