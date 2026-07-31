@@ -228,7 +228,7 @@ def find_frequent_rules(rules, ignore_condition_order=False):
 
     rule_groups = {}
 
-    for rule in rules:
+    for source_rule_id, rule in enumerate(rules, start=1):
         rule_key = __transform_rule(rule, ignore_condition_order)
         if rule_key not in rule_groups:
 
@@ -241,6 +241,7 @@ def find_frequent_rules(rules, ignore_condition_order=False):
         rule_groups[rule_key]["occurrences"] += 1
         rule_groups[rule_key]["tree_indices"].add(rule["tree_index"]) #each tree added only one time cause of the set
         rule_groups[rule_key]["matches"].append({
+            "source_rule_id": rule.get("rule_id", source_rule_id),
             "tree_index": rule["tree_index"],
             "leaf_node_id": rule["leaf_node_id"]
         })
@@ -251,7 +252,8 @@ def find_frequent_rules(rules, ignore_condition_order=False):
         if group["occurrences"] > 1:
             group["tree_indices"] = sorted(group["tree_indices"])
             group["tree_count"] = len(group["tree_indices"])
-            group["percentage"] = (group["tree_count"] / total_tree_count) #tot. no of trees containg the rule r/tot no of trees
+            group["total_tree_count"] = total_tree_count
+            group["forest_coverage_percentage"] = (group["tree_count"] / total_tree_count * 100) #tot. no of trees containg the rule r/tot no of trees
             frequent_rules.append(group)
     frequent_rules.sort(key=lambda group: (group["tree_count"], group["occurrences"]), reverse=True)
 
@@ -721,7 +723,8 @@ def save_frequent_rules_json(frequent_rules, output_path: Path):
             "occurrences": group["occurrences"],
             "matches": group["matches"],
             "tree_count": group["tree_count"],
-            "percentage": group["percentage"], # percentage of trees using that rule
+            "total_tree_count": group["total_tree_count"],
+            "forest_coverage_percentage": (group["forest_coverage_percentage"]), # percentage of trees using that rule
             #"support_percentage": group["percentage"] * 100,
             "tree_indices": group["tree_indices"],
             "condition_count": len(representative_rule["conditions"]),
@@ -734,6 +737,51 @@ def save_frequent_rules_json(frequent_rules, output_path: Path):
         json.dump(output_rules, file, indent=2, ensure_ascii=False)
 
     logger.info(f"Frequent rules saved to {output_path}")
+
+def save_frequent_rules_summary_csv(frequent_rules, output_path: Path):
+    """
+    Saves one summary row for each frequent-rule group.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "frequency_rank",
+        "occurrences",
+        "tree_count",
+        "total_tree_count",
+        "forest_coverage_percentage",
+        "condition_count",
+        "predicted_class",
+        "tree_indices",
+        "source_rule_ids",
+        "matches",
+        "formatted_rule"
+    ]
+
+    with output_path.open(mode="w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+
+        writer.writeheader()
+
+        for frequency_rank, group in enumerate(frequent_rules, start=1):
+            representative_rule = group["representative_rule"]
+
+            writer.writerow({
+                "frequency_rank": frequency_rank,
+                "occurrences": group["occurrences"],
+                "tree_count": group["tree_count"],
+                "total_tree_count": group["total_tree_count"],
+                "forest_coverage_percentage": (group["forest_coverage_percentage"]),
+                "condition_count": len(representative_rule["conditions"]),
+                "predicted_class": (representative_rule["predicted_class_label"]),
+                "tree_indices": json.dumps(group["tree_indices"]), # dumps stores the list into a single cell of the csv
+                "source_rule_ids": json.dumps([match["source_rule_id"] for match in group["matches"]]),
+                "matches": json.dumps(group["matches"]),
+                "formatted_rule": __format_rule(representative_rule, use_original_threshold=False)
+            })
+
+    logger.info("Frequent-rule summary saved to %s", output_path)
+
 
 def analyze_and_save_frequent_rules(rules, output_dir):
     """
@@ -750,15 +798,16 @@ def analyze_and_save_frequent_rules(rules, output_dir):
 
     first_group = frequent_rules[0]
     representative_rule = first_group["representative_rule"]
-    logger.info(f"Most frequent exact rule: occurrences={first_group['occurrences']}, tree_count={first_group['tree_count']}, percentage=%.2f%%, trees={first_group['tree_indices']}", first_group['percentage'] * 100)
+    logger.info(f"Most frequent exact rule: occurrences={first_group['occurrences']}, tree_count={first_group['tree_count']}, forest_coverage=%.2f%%, trees={first_group['tree_indices']}",  first_group["forest_coverage_percentage"])
     logger.info(f"Most frequent rule has {len(representative_rule['conditions'])} conditions and predicts class {representative_rule['predicted_class_index']}.")
     logger.info("Most frequent rule:\n%s", __format_rule(representative_rule, use_original_threshold=False))
 
     frequent_json_path = (output_dir / "frequent_rules.json")
     frequent_txt_path = (output_dir / "frequent_rules.txt")
-
+    frequent_csv_path = (output_dir / "frequent_rules_summary.csv")
     save_frequent_rules_json(frequent_rules=frequent_rules, output_path=frequent_json_path)
     save_frequent_rules_txt(frequent_rules=frequent_rules, output_path=frequent_txt_path)
+    save_frequent_rules_summary_csv(frequent_rules=frequent_rules, output_path=frequent_csv_path)
     return frequent_rules
 
 def save_frequent_rules_txt(frequent_rules, output_path: Path):
@@ -780,7 +829,8 @@ def save_frequent_rules_txt(frequent_rules, output_path: Path):
             file.write("Matches:\n")
             for match in group["matches"]:
                 file.write(f"  - tree {match['tree_index']}, leaf {match['leaf_node_id']}\n")
-            file.write(f"Percentage of trees using the rule in the forest: {group['percentage'] * 100:.2f}%\n")
+            #file.write(f"Percentage of trees using the rule in the forest: {group['percentage'] * 100:.2f}%\n")
+            file.write(f"Forest coverage: {group['forest_coverage_percentage']:.2f}%\n")
             file.write(f"Tree indices: {group['tree_indices']}\n")
             file.write(f"Predicted class: {representative_rule['predicted_class_label']}\n")
             file.write(f"Number of conditions: {len(representative_rule['conditions'])}\n")
@@ -1008,6 +1058,8 @@ def main():
             logger.info(f"First condition model threshold: {first_condition['threshold']}")
             logger.info(f"First condition original threshold: {original_threshold}")
         """
+        for rule_id, rule in enumerate(all_rules, start=1):
+            rule["rule_id"] = rule_id
         if scalers is not None and all_rules:
             add_original_thresholds(rules=all_rules, scalers=scalers)
             scaler_type_counts = {}
