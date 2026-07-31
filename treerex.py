@@ -735,6 +735,32 @@ def save_frequent_rules_json(frequent_rules, output_path: Path):
 
     logger.info(f"Frequent rules saved to {output_path}")
 
+def analyze_and_save_frequent_rules(rules, output_dir):
+    """
+    Finds frequent rules and saves them.
+    """
+    validate_rules(rules)
+
+    logger.info("Analysing %d extracted rules.", len(rules))
+
+    frequent_rules = find_frequent_rules(rules, ignore_condition_order=True)
+    if not frequent_rules:
+        logger.info("No duplicate rules were found.")
+        return []
+
+    first_group = frequent_rules[0]
+    representative_rule = first_group["representative_rule"]
+    logger.info(f"Most frequent exact rule: occurrences={first_group['occurrences']}, tree_count={first_group['tree_count']}, percentage=%.2f%%, trees={first_group['tree_indices']}", first_group['percentage'] * 100)
+    logger.info(f"Most frequent rule has {len(representative_rule['conditions'])} conditions and predicts class {representative_rule['predicted_class_index']}.")
+    logger.info("Most frequent rule:\n%s", __format_rule(representative_rule, use_original_threshold=False))
+
+    frequent_json_path = (output_dir / "frequent_rules.json")
+    frequent_txt_path = (output_dir / "frequent_rules.txt")
+
+    save_frequent_rules_json(frequent_rules=frequent_rules, output_path=frequent_json_path)
+    save_frequent_rules_txt(frequent_rules=frequent_rules, output_path=frequent_txt_path)
+    return frequent_rules
+
 def save_frequent_rules_txt(frequent_rules, output_path: Path):
     """
     Saves frequent rules in a human-readable format.
@@ -891,25 +917,9 @@ def main():
         validate_input(rules_path, "Rules file")
         rules = load_rules_json(rules_path)
         validate_rules(rules)
-        logger.info(f"\033[33mAnalysing {len(rules)} extracted rules.\033[0m")
-
-        frequent_rules = find_frequent_rules(rules, ignore_condition_order=True)
-        if frequent_rules:
-            first_group = frequent_rules[0]
-            representative_rule = first_group['representative_rule']
-
-            logger.info(f"Most frequent exact rule: occurrences={first_group['occurrences']}, tree_count={first_group['tree_count']}, trees={first_group['tree_indices']}")
-            logger.info(f"Most frequent rule has {len(representative_rule['conditions'])} conditions and predicts class {representative_rule['predicted_class_index']}.")
-            logger.info(f"Most frequent rule:\n{__format_rule(representative_rule, use_original_threshold=False)}")
-            logger.info(f"Most frequent exact rule: occurrences={first_group['occurrences']}, tree_count={first_group['tree_count']}, percentage=%.2f%%, trees={first_group['tree_indices']}", first_group['percentage'] * 100)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            run_output_dir = (args.output_dir / "frequent_rules" / timestamp)
-            frequent_json_path = (run_output_dir / "frequent_rules.json")
-            frequent_txt_path = (run_output_dir / "frequent_rules.txt")
-            save_frequent_rules_json(frequent_rules=frequent_rules, output_path=frequent_json_path)
-            save_frequent_rules_txt(frequent_rules=frequent_rules, output_path=frequent_txt_path)
-        else:
-            logger.info("No duplicate rules were found.")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_output_dir = (args.output_dir / "frequent_rules" / timestamp)
+        analyze_and_save_frequent_rules(rules=rules, output_dir=run_output_dir)
         return
 
     if model_path is None:
@@ -1041,6 +1051,9 @@ def main():
 
         save_rules_json(rules=all_rules, output_path=json_output_path)
         save_rules_summary_csv(rules=all_rules, output_path=summary_output_path)
+        frequent_rules_output_dir = (run_output_dir / "frequent_rules")
+        analyze_and_save_frequent_rules(rules=all_rules, output_dir=frequent_rules_output_dir)
+
 
 
 if __name__ == "__main__":
