@@ -30,8 +30,9 @@ def parse_arguments():
     parser.add_argument(
         "--model",
         type=Path,
-        required=True,
-        help="Path to the Random Forest model."
+        #required=True,
+        default=None,
+        help="Path to the Random Forest model. Required for the validate, inspect and extract modalities."
     )
 
     parser.add_argument(
@@ -49,10 +50,17 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "--rules",
+        type=Path,
+        default=None,
+        help=("Optional path to a rules.json file. Required when mode is 'frequent-rules'.")
+    )
+
+    parser.add_argument(
         "--mode",
-        choices=["validate", "inspect", "extract"],
+        choices=["validate", "inspect", "extract", "frequent-rules"],
         default="validate",
-        help="Execution mode: 'validate' only checks inputs; 'inspect' prints basic tree information; 'extract' extracts decisional tree rules."
+        help="Execution mode: 'validate' only checks inputs; 'inspect' prints basic tree information; 'extract' extracts decisional tree rules; 'frequent-rules' extracts the most frequent rules from a .json file provive through the --rules arg."
     )
 
     parser.add_argument(
@@ -143,6 +151,113 @@ def validate_model_scalers(model, scalers):
     for feature_index, scaler in enumerate(scalers):
         if not hasattr(scaler, "transform"): # non usiamo fit_transform ma transform durante l'inferenza
             raise TypeError(f"Object at feature position {feature_index} does not provide transform().")
+
+def validate_rules(rules):
+    """
+    Verifies and validates the structure required for rule analysis.
+    """
+    required_rule_fields = {
+        "tree_index",
+        "leaf_node_id",
+        "conditions",
+        "predicted_class_index"
+    }
+
+    required_condition_fields = {
+        "feature_index",
+        "operator",
+        "threshold",
+        #"accepts_missing"
+    }
+
+    for rule_index, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            raise TypeError(f"Rule {rule_index} must be a dictionary.")
+
+        missing_rule_fields = required_rule_fields - rule.keys()
+
+        if missing_rule_fields:
+            raise ValueError(f"Rule {rule_index} is missing fields: {sorted(missing_rule_fields)}")
+
+        if not isinstance(rule["conditions"], list):
+            raise TypeError(f"Conditions of rule {rule_index} must be a list.")
+
+        for condition_index, condition in enumerate(rule["conditions"]):
+            if not isinstance(condition, dict):
+                raise TypeError(f"Condition {condition_index} of rule {rule_index} must be a dictionary.")
+
+            missing_condition_fields = (required_condition_fields - condition.keys())
+
+            if missing_condition_fields:
+                raise ValueError(f"Condition {condition_index} of rule {rule_index} is missing fields: {sorted(missing_condition_fields)}")
+
+    logger.info(f"Successfully validated {len(rules)} rules.")
+
+def __transform_condition(condition):
+    """
+    Transforms the representation from, e.g.,
+    {feature_index: 385, operator: <=, threshold: -1.82092, accept_missing:false}
+    to (384, "<=", -1.82092, False).
+    This is done to normalize a condition so that can be fairly compared to others.
+    """
+    return (condition["feature_index"], condition["operator"], condition["threshold"], condition.get("accepts_missing"))
+
+def __transform_rule(rule, ignore_condition_order=False):
+    """
+    Transforms the structure of each rule so that it can become comparable while being represented by a tuple of transformed conditions.
+    When ignore_condition_order=True the following becomes true: A and B = B and A
+    """
+    transformed_conditions = []
+
+    for condition in rule["conditions"]:
+        transformed_condition = __transform_condition(condition)
+        transformed_conditions.append(transformed_condition)
+
+    if ignore_condition_order:
+        conditions_key = frozenset(transformed_conditions)# the set becomes immutable and we can have: frozenset({A, B}) == frozenset({B, A})
+    else:
+        conditions_key = tuple(transformed_conditions)
+
+    return (conditions_key, rule["predicted_class_index"])
+
+def find_frequent_rules(rules, ignore_condition_order=False):
+    """
+    Groups rules having exactly the same conditions and predicted class.
+    """
+    total_tree_count = len({rule["tree_index"] for rule in rules})
+
+    rule_groups = {}
+
+    for rule in rules:
+        rule_key = __transform_rule(rule, ignore_condition_order)
+        if rule_key not in rule_groups:
+
+            rule_groups[rule_key] = {
+                "occurrences": 0, #first time, counter = 0 then we increment
+                "tree_indices": set(),
+                'matches': [],
+                "representative_rule": rule
+            }
+        rule_groups[rule_key]["occurrences"] += 1
+        rule_groups[rule_key]["tree_indices"].add(rule["tree_index"]) #each tree added only one time cause of the set
+        rule_groups[rule_key]["matches"].append({
+            "tree_index": rule["tree_index"],
+            "leaf_node_id": rule["leaf_node_id"]
+        })
+
+    frequent_rules = []
+    for group in rule_groups.values():
+        # the rule becomes relevant only if redundant
+        if group["occurrences"] > 1:
+            group["tree_indices"] = sorted(group["tree_indices"])
+            group["tree_count"] = len(group["tree_indices"])
+            group["percentage"] = (group["tree_count"] / total_tree_count) #tot. no of trees containg the rule r/tot no of trees
+            frequent_rules.append(group)
+    frequent_rules.sort(key=lambda group: (group["tree_count"], group["occurrences"]), reverse=True)
+
+    logger.info("Found %d exact rules occurring more than once.", len(frequent_rules))
+
+    return frequent_rules
 
 def inspect_tree(model: RandomForestClassifier, feature_names: Sequence[str], tree_index: int):
     """
@@ -435,6 +550,21 @@ def extract_rules(model: RandomForestClassifier, feature_names: Sequence[str], t
     logger.info(f"Successfully extracted {len(rules)} rules from tree {tree_index}")
     return rules
 
+def load_rules_json(rules_path: Path):
+    """
+    Loads previously extracted rules from a .json file.
+    """
+    logger.info("Loading rules from %s", rules_path)
+
+    with rules_path.open(mode="r", encoding="utf-8") as file:
+        rules = json.load(file)
+
+    if not isinstance(rules, list):
+        raise TypeError("The rules.json file does not contain a list of rules.")
+
+    logger.info("Successfully loaded %d rules.",len(rules))
+    return rules
+
 def load_model(model_path):
     """
     Loads the pre-trained Random Forest Classifier's model from a pickle file.
@@ -573,6 +703,64 @@ def save_tree_visualization( model: RandomForestClassifier, feature_names: Seque
     except subprocess.CalledProcessError as exc:
         logger.warning(f"Graphviz failed while graphically creating the tree {tree_index}. The .dot file is still available at {dot_path}. Error: {exc.stderr}")
 
+def save_frequent_rules_json(frequent_rules, output_path: Path):
+    """
+    Saves frequent-rule groups in JSON format.
+    """
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    output_rules = []
+
+    for rank, group in enumerate(frequent_rules, start=1):
+        representative_rule = group["representative_rule"]
+        output_rules.append({
+            "frequency_rank": rank, # posizione in graduatoria della regola nella graduatoria delle regole frequenti
+            "occurrences": group["occurrences"],
+            "matches": group["matches"],
+            "tree_count": group["tree_count"],
+            "percentage": group["percentage"], # percentage of trees using that rule
+            #"support_percentage": group["percentage"] * 100,
+            "tree_indices": group["tree_indices"],
+            "condition_count": len(representative_rule["conditions"]),
+            "predicted_class_index": representative_rule["predicted_class_index"],
+            "predicted_class_label": representative_rule.get("predicted_class_label"),
+            "conditions": representative_rule["conditions"],
+            "formatted_rule": __format_rule(representative_rule, use_original_threshold=False)
+        })
+    with output_path.open(mode="w", encoding="utf-8") as file:
+        json.dump(output_rules, file, indent=2, ensure_ascii=False)
+
+    logger.info(f"Frequent rules saved to {output_path}")
+
+def save_frequent_rules_txt(frequent_rules, output_path: Path):
+    """
+    Saves frequent rules in a human-readable format.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_path.open(mode="w", encoding="utf-8") as file:
+
+        for frequency_rank, group in enumerate(frequent_rules, start=1):
+            representative_rule = group["representative_rule"]
+
+            formatted_rule = __format_rule(representative_rule, use_original_threshold=False)
+
+            file.write(f"FREQUENT RULE {frequency_rank}\n")
+            file.write(f"Occurrences: {group['occurrences']}\n")
+            file.write(f"Trees containing the rule: {group['tree_count']}\n")
+            file.write("Matches:\n")
+            for match in group["matches"]:
+                file.write(f"  - tree {match['tree_index']}, leaf {match['leaf_node_id']}\n")
+            file.write(f"Percentage of trees using the rule in the forest: {group['percentage'] * 100:.2f}%\n")
+            file.write(f"Tree indices: {group['tree_indices']}\n")
+            file.write(f"Predicted class: {representative_rule['predicted_class_label']}\n")
+            file.write(f"Number of conditions: {len(representative_rule['conditions'])}\n")
+            file.write(f"{formatted_rule}\n\n")
+    logger.info(f"Human-readable frequent rules saved to {output_path}")
+
 def replace_missing_split_labels(dot_path: Path, estimator, feature_names: Sequence[str]):
     """
     Replace Graphviz labels including nan (e.g., 'feature <= nan') with explicit
@@ -696,6 +884,36 @@ def main():
     model_path = args.model
     features_path = args.features
     scalers_path = args.scalers
+    rules_path = args.rules
+    if args.mode == "frequent-rules":
+        if rules_path is None:
+            raise ValueError("--rules is required when --mode frequent-rules is selected.")
+        validate_input(rules_path, "Rules file")
+        rules = load_rules_json(rules_path)
+        validate_rules(rules)
+        logger.info(f"\033[33mAnalysing {len(rules)} extracted rules.\033[0m")
+
+        frequent_rules = find_frequent_rules(rules, ignore_condition_order=True)
+        if frequent_rules:
+            first_group = frequent_rules[0]
+            representative_rule = first_group['representative_rule']
+
+            logger.info(f"Most frequent exact rule: occurrences={first_group['occurrences']}, tree_count={first_group['tree_count']}, trees={first_group['tree_indices']}")
+            logger.info(f"Most frequent rule has {len(representative_rule['conditions'])} conditions and predicts class {representative_rule['predicted_class_index']}.")
+            logger.info(f"Most frequent rule:\n{__format_rule(representative_rule, use_original_threshold=False)}")
+            logger.info(f"Most frequent exact rule: occurrences={first_group['occurrences']}, tree_count={first_group['tree_count']}, percentage=%.2f%%, trees={first_group['tree_indices']}", first_group['percentage'] * 100)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_output_dir = (args.output_dir / "frequent_rules" / timestamp)
+            frequent_json_path = (run_output_dir / "frequent_rules.json")
+            frequent_txt_path = (run_output_dir / "frequent_rules.txt")
+            save_frequent_rules_json(frequent_rules=frequent_rules, output_path=frequent_json_path)
+            save_frequent_rules_txt(frequent_rules=frequent_rules, output_path=frequent_txt_path)
+        else:
+            logger.info("No duplicate rules were found.")
+        return
+
+    if model_path is None:
+        raise ValueError(f"--model is required when --mode {args.mode} is selected.")
     # control file existance
     validate_input(model_path, "Model file")
     if features_path is not None:
@@ -800,7 +1018,7 @@ def main():
                 formatted_rules_original.append(original_rule)
         if len(formatted_rules_model) != len(all_rules):
             raise RuntimeError(f"Rule formatting inconsistency: extracted {len(all_rules)} rules, but formatted {len(formatted_rules_model)}.")
-        if scalers is not None and len(formatted_rules_original) != len(all_rules)):
+        if scalers is not None and len(formatted_rules_original) != len(all_rules):
             raise RuntimeError(f"Scaler-space inconsistency: extracted {len(all_rules)} rules, but formatted {len(formatted_rules_original)}.")
         if formatted_rules_model:
             logger.info(f"First formatted rule:\n{formatted_rules_model[0]}")
@@ -823,6 +1041,7 @@ def main():
 
         save_rules_json(rules=all_rules, output_path=json_output_path)
         save_rules_summary_csv(rules=all_rules, output_path=summary_output_path)
+
 
 if __name__ == "__main__":
     start_time = time.time()
