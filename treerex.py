@@ -275,11 +275,11 @@ def inspect_tree(model: RandomForestClassifier, feature_names: Sequence[str], tr
     logger.info("\033[32mTree max depth: %d\033[0m", estimator.get_depth())
     logger.info("\033[32mTree number of leaves: %d\033[0m", estimator.get_n_leaves())
 
-    max_nodes_to_print = min(10, tree.node_count)
+    #max_nodes_to_print = min(10, tree.node_count)
+    max_nodes_to_print = tree.node_count
+    logger.info("\033[33m%d nodes to be printed:\033[0m", max_nodes_to_print)
 
-    logger.info("\033[33mFirst %d nodes:\033[0m", max_nodes_to_print)
-
-    for node_id in range(max_nodes_to_print):
+    for node_id in range(tree.node_count):
         feature_index = tree.feature[node_id]
 
         if feature_index == -2: # leaf node
@@ -1028,7 +1028,7 @@ def main():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_name = model_path.stem
 
-        run_output_dir = (args.output_dir / model_name / timestamp)
+        run_output_dir = (args.output_dir / model_name / f"tree_inspection_{timestamp}")
 
         inspection_output_path = run_output_dir / "tree_inspection.csv"
 
@@ -1089,7 +1089,7 @@ def main():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_name = model_path.stem
 
-        run_output_dir = (args.output_dir / model_name / timestamp)
+        run_output_dir = (args.output_dir / model_name / f"rules_extraction_{timestamp}")
 
         txt_output_path = run_output_dir / "rules.txt"
 
