@@ -13,6 +13,8 @@ from datetime import datetime
 import subprocess
 import math
 import re
+from utils import (load_model, load_feature_names, load_scalers, load_rules_json, validate_input, validate_model_features,
+                   validate_model_scalers, validate_rules)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 
@@ -106,7 +108,7 @@ def validate_model_features(model: RandomForestClassifier, feature_names: Sequen
     if model_feature_count != input_feature_count:
         raise ValueError(f"Inconsistency: model expects {model_feature_count} features, but the feature file contains {input_feature_count} rows.")
 
-def __expand_condition(missing_go_to_left, threshold, feature_name, node_id, left_child, right_child):
+def _expand_condition(missing_go_to_left, threshold, feature_name, node_id, left_child, right_child):
     if math.isnan(threshold):
         split_type = "missing"
         threshold_for_csv = ""
@@ -193,7 +195,7 @@ def validate_rules(rules):
 
     logger.info(f"Successfully validated {len(rules)} rules.")
 
-def __transform_condition(condition):
+def _transform_condition(condition):
     """
     Transforms the representation from, e.g.,
     {feature_index: 385, operator: <=, threshold: -1.82092, accept_missing:false}
@@ -202,7 +204,7 @@ def __transform_condition(condition):
     """
     return (condition["feature_index"], condition["operator"], condition["threshold"], condition.get("accepts_missing"))
 
-def __transform_rule(rule, ignore_condition_order=False):
+def _transform_rule(rule, ignore_condition_order=False):
     """
     Transforms the structure of each rule so that it can become comparable while being represented by a tuple of transformed conditions.
     When ignore_condition_order=True the following becomes true: A and B = B and A
@@ -210,7 +212,7 @@ def __transform_rule(rule, ignore_condition_order=False):
     transformed_conditions = []
 
     for condition in rule["conditions"]:
-        transformed_condition = __transform_condition(condition)
+        transformed_condition = _transform_condition(condition)
         transformed_conditions.append(transformed_condition)
 
     if ignore_condition_order:
@@ -229,7 +231,7 @@ def find_frequent_rules(rules, ignore_condition_order=False):
     rule_groups = {}
 
     for source_rule_id, rule in enumerate(rules, start=1):
-        rule_key = __transform_rule(rule, ignore_condition_order)
+        rule_key = _transform_rule(rule, ignore_condition_order)
         if rule_key not in rule_groups:
 
             rule_groups[rule_key] = {
@@ -314,7 +316,7 @@ def inspect_tree(model: RandomForestClassifier, feature_names: Sequence[str], tr
             right_child = int(tree.children_right[node_id])
             samples = int(tree.n_node_samples[node_id])
             missing_go_to_left = (bool(tree.missing_go_to_left[node_id]) if hasattr(tree, "missing_go_to_left") else None)
-            split_type, threshold_for_csv, condition = __expand_condition(missing_go_to_left, threshold, feature_name,
+            split_type, threshold_for_csv, condition = _expand_condition(missing_go_to_left, threshold, feature_name,
                                                                           node_id, left_child, right_child)
             inspection_rows.append({
                 "tree_index": tree_index,
@@ -335,7 +337,7 @@ def inspect_tree(model: RandomForestClassifier, feature_names: Sequence[str], tr
             })
     return inspection_rows
 
-def __visit_node(model, tree, feature_names, tree_index, node_id, current_conditions, rules):
+def _visit_node(model, tree, feature_names, tree_index, node_id, current_conditions, rules):
     """
     Visits the node, traverses the tree and extracts rules from the current node.
     """
@@ -410,11 +412,11 @@ def __visit_node(model, tree, feature_names, tree_index, node_id, current_condit
 
         left_conditions = current_conditions + [left_condition]
         right_conditions = current_conditions + [right_condition]
-        __visit_node(model, tree, feature_names, tree_index, left_child, left_conditions, rules)
-        __visit_node(model, tree, feature_names, tree_index, right_child, right_conditions, rules)
+        _visit_node(model, tree, feature_names, tree_index, left_child, left_conditions, rules)
+        _visit_node(model, tree, feature_names, tree_index, right_child, right_conditions, rules)
         return
 
-def __format_condition(condition, use_original_threshold=False):
+def _format_condition(condition, use_original_threshold=False):
     """
     Formats a condition. If use_original_threshold=False, then scalers are used.
     """
@@ -445,7 +447,7 @@ def __format_condition(condition, use_original_threshold=False):
 
     return numeric_condition
 
-def __format_rule(rule, use_original_threshold=False):
+def _format_rule(rule, use_original_threshold=False):
     """
     Converts the conditions into a text and adds the text to a list.
     All conditions are then joined through an 'AND'.
@@ -453,7 +455,7 @@ def __format_rule(rule, use_original_threshold=False):
     """
     rule_text = "IF "
     for condition_index, condition in enumerate(rule["conditions"]):
-        condition_text = __format_condition(condition, use_original_threshold)
+        condition_text = _format_condition(condition, use_original_threshold)
         if condition_index > 0:
             rule_text += " AND "
 
@@ -468,7 +470,7 @@ def __format_rule(rule, use_original_threshold=False):
 
     return rule_text
 
-def __validate_rule_path(tree, rule):
+def _validate_rule_path(tree, rule):
     expected_node_id = 0
 
     for condition in rule["conditions"]:
@@ -493,7 +495,7 @@ def __validate_rule_path(tree, rule):
     if expected_node_id != rule["leaf_node_id"]:
         raise RuntimeError(f"Rule ends at node {expected_node_id}, but its declared leaf is {rule['leaf_node_id']}.")
 
-def __recover_original_threshold(condition, scalers):
+def _recover_original_threshold(condition, scalers):
     threshold = condition["threshold"]
     if threshold is None:
         return None
@@ -520,7 +522,7 @@ def add_original_thresholds(rules, scalers):
 
     for rule in rules:
         for condition in rule["conditions"]:
-            original_threshold = __recover_original_threshold(condition=condition, scalers=scalers)
+            original_threshold = _recover_original_threshold(condition=condition, scalers=scalers)
             condition["threshold_original"] = original_threshold
             if original_threshold is not None:
                 converted_thresholds += 1
@@ -542,9 +544,9 @@ def extract_rules(model: RandomForestClassifier, feature_names: Sequence[str], t
 
     rules = []
     current_conditions = []
-    __visit_node(model, tree, feature_names, tree_index, node_id=0, current_conditions=current_conditions, rules= rules)
+    _visit_node(model, tree, feature_names, tree_index, node_id=0, current_conditions=current_conditions, rules= rules)
     for rule in rules:
-        __validate_rule_path(tree, rule)
+        _validate_rule_path(tree, rule)
 
     expected_rules = estimator.get_n_leaves()
     if len(rules) != expected_rules:
@@ -731,7 +733,7 @@ def save_frequent_rules_json(frequent_rules, output_path: Path):
             "predicted_class_index": representative_rule["predicted_class_index"],
             "predicted_class_label": representative_rule.get("predicted_class_label"),
             "conditions": representative_rule["conditions"],
-            "formatted_rule": __format_rule(representative_rule, use_original_threshold=False)
+            "formatted_rule": _format_rule(representative_rule, use_original_threshold=False)
         })
     with output_path.open(mode="w", encoding="utf-8") as file:
         json.dump(output_rules, file, indent=2, ensure_ascii=False)
@@ -777,7 +779,7 @@ def save_frequent_rules_summary_csv(frequent_rules, output_path: Path):
                 "tree_indices": json.dumps(group["tree_indices"]), # dumps stores the list into a single cell of the csv
                 "source_rule_ids": json.dumps([match["source_rule_id"] for match in group["matches"]]),
                 "matches": json.dumps(group["matches"]),
-                "formatted_rule": __format_rule(representative_rule, use_original_threshold=False)
+                "formatted_rule": _format_rule(representative_rule, use_original_threshold=False)
             })
 
     logger.info("Frequent-rule summary saved to %s", output_path)
@@ -800,7 +802,7 @@ def analyze_and_save_frequent_rules(rules, output_dir):
     representative_rule = first_group["representative_rule"]
     logger.info(f"Most frequent exact rule: occurrences={first_group['occurrences']}, tree_count={first_group['tree_count']}, forest_coverage=%.2f%%, trees={first_group['tree_indices']}",  first_group["forest_coverage_percentage"])
     logger.info(f"Most frequent rule has {len(representative_rule['conditions'])} conditions and predicts class {representative_rule['predicted_class_index']}.")
-    logger.info("Most frequent rule:\n%s", __format_rule(representative_rule, use_original_threshold=False))
+    logger.info("Most frequent rule:\n%s", _format_rule(representative_rule, use_original_threshold=False))
 
     frequent_json_path = (output_dir / "frequent_rules.json")
     frequent_txt_path = (output_dir / "frequent_rules.txt")
@@ -821,7 +823,7 @@ def save_frequent_rules_txt(frequent_rules, output_path: Path):
         for frequency_rank, group in enumerate(frequent_rules, start=1):
             representative_rule = group["representative_rule"]
 
-            formatted_rule = __format_rule(representative_rule, use_original_threshold=False)
+            formatted_rule = _format_rule(representative_rule, use_original_threshold=False)
 
             file.write(f"FREQUENT RULE {frequency_rank}\n")
             file.write(f"Occurrences: {group['occurrences']}\n")
@@ -1047,13 +1049,13 @@ def main():
         """
         if all_rules:
             logger.info("\nFirst extracted rule:\n%s", json.dumps(all_rules[0], indent=2))
-            logger.info(f"\nFirst formatted rule:\n{__format_rule(all_rules[0])}")
+            logger.info(f"\nFirst formatted rule:\n{_format_rule(all_rules[0])}")
         
 
         if scalers is not None and all_rules:
             first_condition = all_rules[0]["conditions"][0]
 
-            original_threshold = __recover_original_threshold(condition=first_condition, scalers=scalers)
+            original_threshold = _recover_original_threshold(condition=first_condition, scalers=scalers)
 
             logger.info(f"First condition model threshold: {first_condition['threshold']}")
             logger.info(f"First condition original threshold: {original_threshold}")
@@ -1073,10 +1075,10 @@ def main():
         formatted_rules_model = []
         formatted_rules_original = []
         for rule in all_rules:
-            model_rule = __format_rule(rule, use_original_threshold=False)
+            model_rule = _format_rule(rule, use_original_threshold=False)
             formatted_rules_model.append(model_rule)
             if scalers is not None:
-                original_rule = __format_rule(rule, use_original_threshold=True)
+                original_rule = _format_rule(rule, use_original_threshold=True)
                 formatted_rules_original.append(original_rule)
         if len(formatted_rules_model) != len(all_rules):
             raise RuntimeError(f"Rule formatting inconsistency: extracted {len(all_rules)} rules, but formatted {len(formatted_rules_model)}.")
