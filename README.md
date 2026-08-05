@@ -9,10 +9,10 @@ Tree Rules Extractor (3REx) automatically extracts rules from pre-trained *sklea
 
 ## Input files
 Suppose having the following input files in the *'input/'* directory:
-- model.pkl
-- feature_names.csv
-- scalers.pkl
-- rules.json
+- model.pkl : Scikit-learn RandomForestClassifier model
+- feature_names.csv : names of the features
+- scalers.pkl : original scalers used by the model
+- rules.json : rules, previously generated through 3REx
 
 Not all files are required for every mode.
 
