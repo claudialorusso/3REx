@@ -27,13 +27,13 @@ The maximum visualization depth is set to 1000.
 
 ### Extracting rules
 
-`python treerex.py --mode extract --model input/model.pkl`
+`python treerex.py --mode extract --model input/model.pkl --features input/feature_names.csv`
 
 This command extracts all the decision rules produced by the Random Forest and identifies the most frequent rules.
 
 ### Extracting rules with scalers
 
-`python treerex.py --mode extract --model input/model.pkl --scalers input/scalers.pkl`
+`python treerex.py --mode extract --model input/model.pkl --features input/feature_names.csv --scalers input/scalers.pkl`
 
 The command extracts all the rules produced by the model.
 When provided with the pre-processing scalers object (`--scalers input/scalers.pkl`) 3REx also recovers the thresholds in the original feature scale.
