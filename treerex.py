@@ -13,8 +13,7 @@ from datetime import datetime
 import subprocess
 import math
 import re
-from utils import (load_model, load_feature_names, load_scalers, load_rules_json, validate_input, validate_model_features,
-                   validate_model_scalers, validate_rules)
+
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 
